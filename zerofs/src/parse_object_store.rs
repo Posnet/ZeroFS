@@ -16,11 +16,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::storage_class_wrapper::StorageClassObjectStore;
 use object_store::ClientOptions;
 use object_store::ObjectStore;
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
 use object_store::path::Path;
+use std::sync::Arc;
 use url::Url;
 
 #[derive(Debug, thiserror::Error)]
@@ -162,6 +164,11 @@ impl ObjectStoreScheme {
 /// - The [`Path`] into the [`ObjectStore`] of the addressed resource
 ///
 /// [`AmazonS3`]: https://docs.rs/object_store/0.12.0/object_store/aws/struct.AmazonS3.html
+///
+/// # Storage Class Support
+/// For S3 backends, if the options contain `aws_storage_class`, all PUT operations
+/// will use that storage class. Valid values include: STANDARD, REDUCED_REDUNDANCY,
+/// STANDARD_IA, ONEZONE_IA, INTELLIGENT_TIERING, GLACIER, DEEP_ARCHIVE, etc.
 pub fn parse_url_opts<I, K, V>(
     url: &Url,
     options: I,
@@ -174,40 +181,66 @@ where
     let (scheme, path) = ObjectStoreScheme::parse(url)?;
     let path = Path::parse(path)?;
 
+    // Collect options to allow extracting storage_class before passing to builder
+    let options: Vec<(String, String)> = options
+        .into_iter()
+        .map(|(k, v)| (k.as_ref().to_string(), v.into()))
+        .collect();
+
+    // Extract storage_class for S3 (used to wrap the store later)
+    let storage_class = options
+        .iter()
+        .find(|(k, _)| k == "aws_storage_class")
+        .map(|(_, v)| v.clone());
+
     let store: Box<dyn ObjectStore> = match scheme {
         ObjectStoreScheme::Local => Box::new(LocalFileSystem::new()),
         ObjectStoreScheme::Memory => Box::new(InMemory::new()),
         ObjectStoreScheme::AmazonS3 => {
-            let builder = options.into_iter().fold(
+            // Filter out storage_class as it's not a valid AmazonS3ConfigKey
+            let filtered_options = options
+                .iter()
+                .filter(|(k, _)| k != "aws_storage_class")
+                .map(|(k, v)| (k.clone(), v.clone()));
+
+            let builder = filtered_options.fold(
                 object_store::aws::AmazonS3Builder::new()
                     .with_url(url.to_string())
                     .with_client_options(ClientOptions::default().with_timeout_disabled()),
-                |builder, (key, value)| match key.as_ref().parse() {
+                |builder, (key, value)| match key.parse() {
                     Ok(k) => builder.with_config(k, value),
                     Err(_) => builder,
                 },
             );
-            Box::new(builder.build()?)
+            let s3_store = builder.build()?;
+
+            // Wrap with StorageClassObjectStore if storage_class is configured
+            if let Some(class) = storage_class {
+                tracing::info!("S3 storage class configured: {}", class);
+                Box::new(StorageClassObjectStore::new(Arc::new(s3_store), class))
+            } else {
+                Box::new(s3_store)
+            }
         }
         ObjectStoreScheme::GoogleCloudStorage => {
-            let builder = options.into_iter().fold(
+            let builder = options.iter().fold(
                 object_store::gcp::GoogleCloudStorageBuilder::new()
                     .with_url(url.to_string())
                     .with_client_options(ClientOptions::default().with_timeout_disabled()),
-                |builder, (key, value)| match key.as_ref().parse() {
-                    Ok(k) => builder.with_config(k, value),
+                |builder, (key, value)| match key.parse() {
+                    Ok(k) => builder.with_config(k, value.clone()),
                     Err(_) => builder,
                 },
             );
             Box::new(builder.build()?)
         }
         ObjectStoreScheme::MicrosoftAzure => {
-            let builder = options.into_iter().fold(
+            let builder = options.iter().fold(
                 object_store::azure::MicrosoftAzureBuilder::new()
                     .with_url(url.to_string())
                     .with_client_options(ClientOptions::default().with_timeout_disabled()),
-                |builder, (key, value)| match key.as_ref().parse() {
-                    Ok(k) => builder.with_config(k, value),
+                |builder, (key, value)| match key.parse() {
+                    Ok(k) => builder.with_config(k, value.clone()),
                     Err(_) => builder,
                 },
             );
