@@ -1,9 +1,12 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo::rerun-if-changed=proto/admin.proto");
 
-    // SAFETY: Build scripts are single-threaded
-    unsafe {
-        std::env::set_var("PROTOC", protobuf_src::protoc());
+    #[cfg(feature = "bundled-protoc")]
+    {
+        // SAFETY: Build scripts are single-threaded
+        unsafe {
+            std::env::set_var("PROTOC", protobuf_src::protoc());
+        }
     }
 
     tonic_prost_build::configure()
